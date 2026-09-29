@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>印前色彩软打样台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <h1>印前色彩软打样台</h1>
+  <div class="subtitle">LittleCMS 色彩管理 · CIEDE2000 像素级色差 · 源→印刷→显示全链路软打样</div>
+</header>
+
+<main>
+  <section class="panel controls">
+    <h2>1. 上传图像</h2>
+    <div class="row">
+      <input type="file" id="imageFile" accept=".tif,.tiff,.png,.jpg,.jpeg">
+      <span id="imageInfo" class="hint"></span>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="useEmbedded"> 使用图像内嵌 ICC 作为源配置</label>
+    </div>
+
+    <h2>2. ICC 配置</h2>
+    <div class="formgrid">
+      <label>源配置 (RGB/CMYK/灰度)
+        <select id="sourceProfile"></select>
+      </label>
+      <label>印刷配置 (CMYK)
+        <select id="pressProfile"></select>
+      </label>
+      <label>显示配置 (RGB)
+        <select id="displayProfile"></select>
+      </label>
+    </div>
+
+    <details class="upload-profiles">
+      <summary>上传自定义 ICC 配置（.icc/.icm）</summary>
+      <div class="row">
+        <select id="uploadRole">
+          <option value="source">源配置</option>
+          <option value="press" selected>印刷配置</option>
+          <option value="display">显示配置</option>
+        </select>
+        <input type="file" id="profileFile" accept=".icc,.icm">
+        <button type="button" id="uploadProfileBtn">上传</button>
+      </div>
+      <div id="profileUploadMsg" class="hint"></div>
+    </details>
+
+    <h2>3. 渲染意图与阈值</h2>
+    <div class="formgrid">
+      <label>源 → 印刷 渲染意图
+        <select id="sourceIntent">
+          <option value="perceptual">感知 (Perceptual)</option>
+          <option value="relative_colorimetric" selected>相对色度 (Relative Colorimetric)</option>
+          <option value="saturation">饱和度 (Saturation)</option>
+          <option value="absolute_colorimetric">绝对色度 (Absolute Colorimetric)</option>
+        </select>
+      </label>
+      <label>Lab → 显示 渲染意图
+        <select id="proofIntent">
+          <option value="perceptual">感知 (Perceptual)</option>
+          <option value="relative_colorimetric" selected>相对色度 (Relative Colorimetric)</option>
+          <option value="saturation">饱和度 (Saturation)</option>
+          <option value="absolute_colorimetric">绝对色度 (Absolute Colorimetric)</option>
+        </select>
+      </label>
+      <label>色差阈值 ΔE00
+        <input type="number" id="threshold" value="3.0" min="0" step="0.1">
+      </label>
+    </div>
+
+    <div class="row">
+      <button type="button" id="runBtn" class="primary">生成软打样</button>
+      <span id="busy" class="hint" hidden>处理中…</span>
+    </div>
+    <div id="errorBox" class="error" hidden></div>
+  </section>
+
+  <section class="panel results" id="resultsPanel" hidden>
+    <div class="tabs">
+      <button class="tab active" data-view="preview">源图显示预览</button>
+      <button class="tab" data-view="softproof">软打样</button>
+      <button class="tab" data-view="heatmap">ΔE 热图</button>
+      <button class="tab" data-view="overlay">热图叠加</button>
+      <button class="tab" data-view="mask">超阈值遮罩</button>
+    </div>
+
+    <div class="canvas-wrap" id="canvasWrap">
+      <img id="viewImage" alt="预览">
+      <canvas id="roiCanvas"></canvas>
+    </div>
+    <div class="hint">在图像上按住鼠标拖拽框选区域，查看该区域各阶段 Lab / CMYK 值。</div>
+
+    <div class="stats" id="statsBar"></div>
+
+    <div id="regionPanel" class="region" hidden>
+      <h3>框选区域分析</h3>
+      <pre id="regionData"></pre>
+    </div>
+
+    <div class="exports">
+      <h3>导出（绑定原图哈希、配置摘要与参数）</h3>
+      <a id="expPreview" class="btn" download>预览 PNG</a>
+      <a id="expProof" class="btn" download>软打样 PNG</a>
+      <a id="expHeat" class="btn" download>热图 PNG</a>
+      <a id="expMask" class="btn" download>遮罩 PNG</a>
+      <a id="expReport" class="btn" download>JSON 报告</a>
+      <a id="expZip" class="btn primary">打包下载 ZIP</a>
+    </div>
+
+    <details class="reportbox">
+      <summary>查看 JSON 报告</summary>
+      <pre id="reportJson"></pre>
+    </details>
+  </section>
+</main>
+
+<footer>
+  所有色彩转换均经 LittleCMS 完成；预览/软打样 PNG 嵌入所选显示配置，热图/遮罩嵌入 sRGB，浏览器不会按未标记数据自行解释。
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
