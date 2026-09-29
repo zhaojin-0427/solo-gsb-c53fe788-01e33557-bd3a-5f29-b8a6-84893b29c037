@@ -123,7 +123,58 @@ def lcms() -> ctypes.CDLL:
     L.cmsD50_XYZ.restype = ctypes.POINTER(_CIEXYZ)
     L.cmsD50_XYZ.argtypes = []
 
+    # High-precision pixel transforms (TYPE_Lab_DBL keeps CIELAB in native
+    # doubles instead of quantizing through the ICC v2 8-bit PCS encoding).
+    L.cmsCreateTransform.restype = ctypes.c_void_p
+    L.cmsCreateTransform.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    L.cmsDoTransform.restype = None
+    L.cmsDoTransform.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32
+    ]
+    L.cmsDeleteTransform.restype = None
+    L.cmsDeleteTransform.argtypes = [ctypes.c_void_p]
+
     return L
+
+
+class _CIELab(ctypes.Structure):
+    """cmsCIELab: three native doubles -- the memory layout of TYPE_Lab_DBL."""
+    _fields_ = [
+        ("L", ctypes.c_double),
+        ("a", ctypes.c_double),
+        ("b", ctypes.c_double),
+    ]
+
+
+# Rendering intent numbers (lcms2.h INTENT_*); identical to ImageCms.Intent.
+INTENT_CODES = {
+    "perceptual": 0,
+    "relative_colorimetric": 1,
+    "saturation": 2,
+    "absolute_colorimetric": 3,
+}
+
+# TYPE_* constants assembled exactly as in lcms2.h.
+_FLOAT_SH = lambda a: a << 22
+_COLORSPACE_SH = lambda s: s << 16
+_CHANNELS_SH = lambda c: c << 3
+_BYTES_SH = lambda b: b
+
+# PT_GRAY 3, PT_RGB 4, PT_CMYK 6, PT_Lab 10.
+_TYPE_GRAY_8 = _COLORSPACE_SH(3) | _CHANNELS_SH(1) | _BYTES_SH(1)
+_TYPE_RGB_8 = _COLORSPACE_SH(4) | _CHANNELS_SH(3) | _BYTES_SH(1)
+_TYPE_CMYK_8 = _COLORSPACE_SH(6) | _CHANNELS_SH(4) | _BYTES_SH(1)
+_TYPE_LAB_DBL = _FLOAT_SH(1) | _COLORSPACE_SH(10) | _CHANNELS_SH(3) | _BYTES_SH(0)
+
+_PIXEL_FORMATS_8BIT = {
+    1: _TYPE_GRAY_8,
+    3: _TYPE_RGB_8,
+    4: _TYPE_CMYK_8,
+}
 
 
 def _profile_to_bytes(handle: ctypes.c_void_p) -> bytes:
@@ -155,6 +206,103 @@ def build_srgb_profile_bytes() -> bytes:
         return _profile_to_bytes(handle)
     finally:
         L.cmsCloseProfile(handle)
+
+
+# ---------------------------------------------------------------------------
+# High-precision pixel transforms (CIELAB as native doubles)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _lab_profile_handle() -> ctypes.c_void_p:
+    """Long-lived handle to the Lab identity profile for the Lab PCS legs."""
+    L = lcms()
+    handle = L.cmsCreateLab2Profile(None)
+    if not handle:
+        raise RuntimeError("cmsCreateLab2Profile 失败")
+    return handle
+
+
+def _open_handle(data: bytes):
+    """Open an ICC blob; return (handle, buffer) keeping the buffer alive."""
+    L = lcms()
+    buf = ctypes.create_string_buffer(data, len(data))
+    handle = L.cmsOpenProfileFromMem(buf, len(data))
+    if not handle:
+        raise RuntimeError("LittleCMS 无法打开 ICC 配置")
+    return handle, buf
+
+
+def pixels_to_lab_double(profile_bytes: bytes, pixels: np.ndarray,
+                         channels: int, intent: int) -> np.ndarray:
+    """Transform 8-bit device pixels to CIELAB via LittleCMS TYPE_Lab_DBL.
+
+    Lab values (L in 0..100, a/b signed) come straight out of lcms as native
+    doubles -- no v2 8-bit PCS quantization, so every CIEDE2000 result uses the
+    full-precision colorimetry.
+    """
+    return _native_transform(
+        profile_bytes, _PIXEL_FORMATS_8BIT[channels],
+        _lab_profile_handle(), _TYPE_LAB_DBL,
+        pixels, intent, np.float64, 3,
+    )
+
+
+def lab_double_to_rgb8(profile_bytes: bytes, lab: np.ndarray,
+                       intent: int) -> np.ndarray:
+    """Transform CIELAB doubles to 8-bit display RGB via LittleCMS."""
+    return _native_transform(
+        _lab_profile_handle(), _TYPE_LAB_DBL,
+        profile_bytes, _TYPE_RGB_8,
+        lab, intent, np.uint8, 3,
+    )
+
+
+def _native_transform(in_profile, in_format, out_profile, out_format,
+                      values: np.ndarray, intent: int,
+                      out_dtype, out_channels: int) -> np.ndarray:
+    """Run a one-shot lcms transform on flattened pixel rows.
+
+    Profile arguments may be ICC bytes (opened here and closed when done) or an
+    already-open cmsHPROFILE (the cached Lab identity, which is never closed).
+    """
+    L = lcms()
+    in_buf = out_buf = None
+    in_opened = out_opened = None
+    try:
+        if isinstance(in_profile, (bytes, bytearray)):
+            in_opened, in_buf = _open_handle(bytes(in_profile))
+            in_h = in_opened
+        else:
+            in_h = in_profile
+        if isinstance(out_profile, (bytes, bytearray)):
+            out_opened, out_buf = _open_handle(bytes(out_profile))
+            out_h = out_opened
+        else:
+            out_h = out_profile
+
+        flat = np.ascontiguousarray(values).reshape(-1, values.shape[-1])
+        n = flat.shape[0]
+        out = np.empty((n, out_channels), dtype=out_dtype)
+        xform = L.cmsCreateTransform(
+            in_h, in_format, out_h, out_format, intent, 0
+        )
+        if not xform:
+            raise RuntimeError("LittleCMS 无法建立高精度色彩转换")
+        try:
+            L.cmsDoTransform(
+                xform,
+                flat.ctypes.data_as(ctypes.c_void_p),
+                out.ctypes.data_as(ctypes.c_void_p),
+                n,
+            )
+        finally:
+            L.cmsDeleteTransform(xform)
+        return out.reshape(*values.shape[:-1], out_channels)
+    finally:
+        if in_opened is not None:
+            L.cmsCloseProfile(in_opened)
+        if out_opened is not None:
+            L.cmsCloseProfile(out_opened)
 
 
 def read_header(data: bytes) -> dict[str, str | int]:

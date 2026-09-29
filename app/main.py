@@ -130,7 +130,7 @@ async def create_job(
         max_dimension=MAX_DIMENSION,
     )
     try:
-        result = pl.run_pipeline(inputs, state.pm, state.lab_profile, state.srgb_profile)
+        result = pl.run_pipeline(inputs, state.pm, state.srgb_profile)
     except (pl.PipelineError, ProfileError) as exc:
         raise HTTPException(422, str(exc))
 

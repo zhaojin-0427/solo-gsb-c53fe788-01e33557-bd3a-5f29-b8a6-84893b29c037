@@ -1,15 +1,15 @@
-"""Color science helpers: Lab encoding, CIEDE2000 and heatmap rendering."""
+"""Color science helpers: CIEDE2000 and heatmap rendering."""
 from __future__ import annotations
 
 import numpy as np
-from PIL import Image
 
 # ---------------------------------------------------------------------------
-# LittleCMS 原始 LAB 模式字节解码 (ICC v2 8-bit encoding)
+# LittleCMS 8-bit LAB 字节解码 (ICC v2 encoding)
 #
-# 注意：这里读取的是 ImageCms.applyTransform 直接返回的图像字节（lcms 原生
-# V2 编码），不要用 PIL 的 Image.new("LAB", ...) 手工构造——PIL 会按它自己
-# 的极性约定重新解释字节。
+# 注意：流水线不再使用该编码参与色差——源色/印后色由 lcms_native 经
+# TYPE_Lab_DBL 原生 double 输出。这里保留解码器，用于读取任何外部产生的
+# ICC v2 8 位 Lab 字节（lcms 原生 V2 编码，不要用 PIL Image.new("LAB")
+# 手工构造——PIL 会按自己的极性约定重新解释字节）。
 #
 # L 通道: 0..255  -> 0..100
 # a,b 通道: 字节 0..127 表示 +0..+127，128..255 表示 -128..-1
@@ -135,7 +135,3 @@ def overlay_heatmap(base_rgb: np.ndarray, heat_rgb: np.ndarray, alpha: float = 0
 def threshold_mask(de: np.ndarray, threshold: float) -> np.ndarray:
     """Binary HxW mask: white (255) where ΔE >= threshold, else black."""
     return (de >= threshold).astype(np.uint8) * 255
-
-
-def lab_image_to_array(img: Image.Image) -> np.ndarray:
-    return decode_lab(np.asarray(img))

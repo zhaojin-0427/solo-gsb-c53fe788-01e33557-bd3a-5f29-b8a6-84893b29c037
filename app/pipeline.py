@@ -1,17 +1,23 @@
 """The soft-proofing color pipeline.
 
-Stages (every pixel, all transforms executed by LittleCMS through Pillow):
+Stages (every pixel, all transforms executed by LittleCMS):
 
-    source pixels --(source profile, source intent)--> Lab          [Lab_src]
-    source pixels --(source profile, source intent)--> press CMYK   [device]
-    press CMYK    --(press profile)--> Lab                          [Lab_press]
+    source pixels --(source profile, source intent)--> Lab (double) [Lab_src]
+    source pixels --(source profile, source intent)--> press CMYK    [device]
+    press CMYK    --(press profile, source intent)--> Lab (double) [Lab_press]
     Lab_press     --(display profile, proof intent)--> display RGB   [proof]
     source pixels --(display profile, source intent)--> display RGB  [preview]
 
-Pixel-level ΔE00 is computed between Lab_src and Lab_press. The browser is
-never asked to interpret untagged data: every RGB image we emit is saved with
-the chosen display profile embedded... (for the screen-facing previews we tag
-sRGB so the file is unambiguous even when a display profile differs).
+The two Lab legs go straight to LittleCMS native-double CIELAB (TYPE_Lab_DBL):
+no ICC v2 8-bit PCS bytes sit between lcms and our CIEDE2000, so pixels whose
+true ΔE00 sits right at the threshold cannot flip mask membership because of
+extra quantization. The same float64 Lab arrays feed the heatmap, mask,
+statistics, region inspection and exported report. The soft proof is still
+rendered through the selected display ICC.
+
+Every RGB image we emit is saved with an ICC profile embedded: preview and
+soft proof in the chosen display profile, the synthetic visualizations tagged
+sRGB so the file is unambiguous.
 """
 from __future__ import annotations
 
@@ -24,7 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image, ImageCms
 
-from . import colorscience
+from . import colorscience, lcms_native
 from .profiles import ProfileManager
 
 INTENTS = {
@@ -149,7 +155,6 @@ class PipelineResult:
 
 
 def run_pipeline(inputs: PipelineInputs, pm: ProfileManager,
-                 lab_profile: ImageCms.ImageCmsProfile,
                  srgb_profile: ImageCms.ImageCmsProfile) -> PipelineResult:
     if inputs.threshold < 0:
         raise PipelineError("色差阈值不能为负")
@@ -165,22 +170,24 @@ def run_pipeline(inputs: PipelineInputs, pm: ProfileManager,
         if not embedded_icc:
             raise PipelineError("图像中没有内嵌的 ICC 配置，无法按“使用内嵌源配置”处理")
         try:
-            from . import lcms_native
             embedded_header = lcms_native.read_header(embedded_icc)
             src_prof = ImageCms.ImageCmsProfile(io.BytesIO(embedded_icc))
         except Exception as exc:
             raise PipelineError(f"内嵌 ICC 配置无效: {exc}") from exc
         src_cs = embedded_header["color_space"]
+        src_bytes = embedded_icc
         embedded_sha = hashlib.sha256(embedded_icc).hexdigest()
         if src_cs not in ("RGB", "CMYK", "GRAY"):
             raise PipelineError(f"内嵌配置的色彩空间不支持: {src_cs}")
     else:
         src_prof = pm.get(inputs.source_profile_id, "source")
-        _, src_header = pm.get_bytes_header(inputs.source_profile_id)
+        src_bytes, src_header = pm.get_bytes_header(inputs.source_profile_id)
         src_cs = src_header["color_space"]
 
     press_prof = pm.get(inputs.press_profile_id, "press")
     display_prof = pm.get(inputs.display_profile_id, "display")
+    press_bytes = pm.load_bytes(inputs.press_profile_id)
+    display_bytes = pm.load_bytes(inputs.display_profile_id)
 
     # ---- strict channel/color-space matching ----------------------------
     pixel_mode = mode
@@ -195,27 +202,49 @@ def run_pipeline(inputs: PipelineInputs, pm: ProfileManager,
             f"源配置为 {src_cs}，拒绝按浏览器默认色彩解释"
         )
     in_mode = "L" if pixel_cs == "GRAY" else pixel_cs
+    n_channels = 1 if pixel_cs == "GRAY" else (4 if pixel_cs == "CMYK" else 3)
+    source_intent_code = lcms_native.INTENT_CODES[inputs.source_intent]
+    proof_intent_code = lcms_native.INTENT_CODES[inputs.proof_intent]
+
+    # 8-bit device pixels feeding the native (double Lab) transforms.
+    src_pixels = np.ascontiguousarray(
+        np.asarray(img).reshape(img.size[1], img.size[0], n_channels)
+    )
 
     # ---- transforms -------------------------------------------------------
-    # Source -> Lab (back-calculation of color values to Lab via source ICC)
-    lab_src_img = _apply(img, _build(src_prof, lab_profile, in_mode, "LAB",
-                                    inputs.source_intent))
-    lab_src = colorscience.lab_image_to_array(lab_src_img)
+    # Source -> Lab, native-double CIELAB straight from LittleCMS (no v2 8-bit
+    # PCS quantization). This Lab_src is the single source of truth used by the
+    # heatmap, mask, stats, region inspection and exported report.
+    try:
+        lab_src = lcms_native.pixels_to_lab_double(
+            src_bytes, src_pixels, n_channels, source_intent_code
+        )
+    except RuntimeError as exc:
+        raise PipelineError(f"源配置→Lab 高精度转换失败: {exc}") from exc
 
-    # Source -> press device CMYK
+    # Source -> press device CMYK (8-bit device values, as on a real plate).
     cmyk_img = _apply(img, _build(src_prof, press_prof, in_mode, "CMYK",
                                  inputs.source_intent))
-    cmyk = np.asarray(cmyk_img)
+    cmyk = np.ascontiguousarray(np.asarray(cmyk_img))
 
-    # Press CMYK -> Lab (沿源→印刷→Lab 回算色值)
-    lab_press_img = _apply(cmyk_img, _build(press_prof, lab_profile, "CMYK", "LAB",
-                                           inputs.source_intent))
-    lab_press = colorscience.lab_image_to_array(lab_press_img)
+    # Press CMYK -> Lab, again native doubles (沿源→印刷→Lab 回算色值).
+    try:
+        lab_press = lcms_native.pixels_to_lab_double(
+            press_bytes, cmyk, 4, source_intent_code
+        )
+    except RuntimeError as exc:
+        raise PipelineError(f"印刷配置→Lab 高精度转换失败: {exc}") from exc
 
-    # Lab_press -> display RGB = the soft proof
-    # (route via CMYK again would be lossy; Lab PCS -> display is the proof).
-    proof_img = _apply(lab_press_img, _build(lab_profile, display_prof, "LAB", "RGB",
-                                             inputs.proof_intent))
+    # Lab_press (double) -> display RGB = the soft proof; still rendered
+    # through the selected display ICC with the selected proof intent.
+    try:
+        proof_rgb = lcms_native.lab_double_to_rgb8(
+            display_bytes, lab_press, proof_intent_code
+        )
+    except RuntimeError as exc:
+        raise PipelineError(f"Lab→显示高精度转换失败: {exc}") from exc
+    proof_img = Image.fromarray(proof_rgb, "RGB")
+
     # Source -> display direct preview
     preview_img = _apply(img, _build(src_prof, display_prof, in_mode, "RGB",
                                     inputs.source_intent))
@@ -329,9 +358,10 @@ def build_report(result: PipelineResult, job_id: str) -> dict:
         },
         "stats": result.stats,
         "lab_note": (
-            "Lab 值取 LittleCMS applyTransform 输出的 ICC v2 8 位 PCS 字节直接解码"
-            "(L*=byte*100/255; a/b: byte<=127 取 byte，否则 byte-256; 0 与 255 均为中性)，"
-            "像素级量化误差约 ±0.5 ΔE00 (p95<0.5)"
+            "Lab 值由 LittleCMS 以高精度 CIELAB (TYPE_Lab_DBL，原生 double) "
+            "直接输出，源色与印后色均不经过 ICC v2 8 位 PCS 字节量化；"
+            "CIEDE2000、热图、遮罩、统计、框选区域与本报告取自同一份逐像素 Lab 结果。"
+            "色差数组以 float32 落盘供区域取色（差异 < 1e-5 ΔE00）。"
         ),
     }
 

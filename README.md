@@ -46,17 +46,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 对每一张上传图像，后端依次执行（全部由 LittleCMS 完成转换，**绝不使用浏览器默认色彩解释**）：
 
 1. **源图显示预览**：源像素 `源配置 → 显示配置`；
-2. **沿 源 → 印刷 → Lab 回算色值**：
+2. **沿 源 → 印刷 → Lab 回算色值**（Lab 由 LittleCMS 以 **TYPE_Lab_DBL 原生 double 高精度**直接输出，不经 ICC v2 8 位 PCS 字节量化）：
    - 源像素 `源配置 → 印刷配置` 得到设备 **CMYK** 值；
-   - CMYK `印刷配置 → Lab PCS` 得到印刷后 Lab；
-   - 同时源像素 `源配置 → Lab PCS` 得到原始 Lab；
-3. **软打样图**：印刷后 Lab `→ 显示配置`（可选择显示渲染意图）；
-4. 对 `Lab_源` 与 `Lab_印刷后` 逐像素计算 **CIEDE2000（ΔE00）**；
+   - CMYK `印刷配置 → Lab PCS（double）` 得到印刷后 Lab；
+   - 同时源像素 `源配置 → Lab PCS（double）` 得到原始 Lab；
+3. **软打样图**：印刷后 Lab（double）`→ 显示配置`（按所选显示渲染意图，呈现仍使用所选显示 ICC）；
+4. 对 `Lab_源` 与 `Lab_印刷后` 两份高精度 Lab 逐像素计算 **CIEDE2000（ΔE00）**；
 5. 生成：
    - **ΔE 热图**（黑→蓝→青→绿→黄→红伪彩色）；
    - **热图叠加图**（半透明叠加在软打样上）；
    - **超阈值二值遮罩**（ΔE00 ≥ 阈值的像素为白色）；
    - 均值 / P95 / 最大 ΔE00 与**超阈值面积比例**统计。
+
+热图、遮罩、统计、框选区域的 Lab/色差值与 `report.json` 全部取自同一份逐像素 double Lab / ΔE00 结果，因此**阈值设在像素实际 ΔE00 附近时不会因额外的 8 位量化翻转临界像素的遮罩归属**。
 
 输出给浏览器的 PNG 均嵌入 ICC 配置，浏览器不会按未标记数据自行解释：**源图显示预览与软打样嵌入所选择的显示配置**（像素本身位于该显示空间）；**ΔE 热图、遮罩与叠加图是无物理色度含义的合成可视化，嵌入 sRGB** 以保证颜色稳定呈现。
 
@@ -162,7 +164,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 实现说明
 
 - **色差公式**：`app/colorscience.py` 中为矢量化 CIEDE2000，已对照 Sharma 等 (2005) 标准测试数据验证（最大偏差 < 1e-3）。
-- **Lab 编码**：流水线使用 ICC **v2 8 位 Lab** 编码（`L = byte·100/255`；a/b：字节 0–127 表示 +0–+127，128–255 表示 −128–−1），像素级量化误差约 ±1 ΔE00，报告中对此有明确说明。
+- **Lab 精度**：源色与印后色通过 `app/lcms_native.py` 以 ctypes 直接调用系统 `liblcms2` 的 `TYPE_Lab_DBL` 变换，CIELAB 以**原生 double** 进入 CIEDE2000，不经过 Pillow 8 位 LAB 图像或 ICC v2 PCS 字节量化；区域取色时 Lab 数组以 float32 落盘（差异 < 1e-5 ΔE00）。软打样仍走 `TYPE_Lab_DBL → 所选显示 ICC（8 位 RGB）`。
 - **合成 CMYK 配置**：`app/lcms_native.py` 通过 ctypes 调用系统 `liblcms2` 的 `cmsCreateProfilePlaceholder` / CLUT16 pipeline API 生成 17³/17⁴ 网格的合法 ICC v2.4 CMYK 配置，保证开箱演示可用。
 - **环境变量**：
   - `SPD_DATA_DIR`（默认 `./data`）：数据根目录；

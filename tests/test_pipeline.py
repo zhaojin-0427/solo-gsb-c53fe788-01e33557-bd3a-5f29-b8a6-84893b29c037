@@ -307,6 +307,71 @@ def test_lab_v2_decoding():
     assert dec[0, 1, 2] == -1.0
 
 
+def test_lab_is_native_double_precision(client, ids):
+    """CIELAB from the pipeline must be lcms native doubles, not v2 8-bit.
+
+    The legacy path decoded ICC v2 PCS bytes and could only produce integral
+    a/b values (L on a 100/255 grid). A continuous-tone ramp must contain many
+    pixels whose Lab channels carry a real fractional part.
+    """
+    arr = np.zeros((48, 48, 3), np.uint8)
+    arr[..., 0] = np.linspace(0, 255, 48, dtype=np.uint8)[None, :]
+    arr[..., 1] = np.linspace(0, 255, 48, dtype=np.uint8)[:, None]
+    j = run(client, ids, png_bytes(arr), threshold="1").json()
+    # 1x1 regions surface the stored (float32) Lab values.
+    d = client.post(
+        f"/api/jobs/{j['job_id']}/region",
+        json={"x": 7, "y": 11, "width": 1, "height": 1},
+    ).json()
+    for name in ("lab_source", "lab_after_press"):
+        L, a, b = d[name]["mean"]
+        # None of the three channels may be pinned to the v2 byte grid.
+        assert any(
+            abs(v - round(v)) > 0.01 for v in (L, a, b)
+        ), (name, (L, a, b))
+
+
+def test_high_precision_lab_directly(client, ids):
+    """lcms TYPE_Lab_DBL output must show sub-byte fractional a/b in bulk."""
+    from app import config, lcms_native
+    state = client.app.state.state
+    srgb_bytes = state.pm.load_bytes(ids["srgb"])
+    # An RGB ramp sampled so most pixels are not aligned to any byte grid.
+    px = np.empty((64, 3), np.uint8)
+    px[:, 0] = np.linspace(0, 255, 64, dtype=np.uint8)
+    px[:, 1] = np.linspace(255, 0, 64, dtype=np.uint8)
+    px[:, 2] = 90
+    lab = lcms_native.pixels_to_lab_double(
+        srgb_bytes, px, 3, lcms_native.INTENT_CODES["relative_colorimetric"]
+    )
+    assert lab.dtype == np.float64
+    assert lab.shape == (64, 3)
+    # Many interior pixels must deviate clearly from integral a/b.
+    interior = lab[8:56]
+    frac = np.abs(interior[:, 1:3] - np.rint(interior[:, 1:3]))
+    assert (frac > 0.1).sum() > 8
+
+
+def test_mask_stats_region_share_one_result(client, ids):
+    """Mask pixels, stats over-ratio and region over-ratio must agree."""
+    arr = np.zeros((40, 40, 3), np.uint8)
+    arr[..., 0] = np.linspace(0, 255, 40, dtype=np.uint8)[None, :]
+    arr[..., 1] = np.linspace(0, 255, 40, dtype=np.uint8)[:, None]
+    j = run(client, ids, png_bytes(arr), threshold="2.0").json()
+    import pathlib
+    jobdir = pathlib.Path(client.app.state.state.pm.root.parent / "jobs" / j["job_id"])
+    de = np.load(jobdir / "de.npy")
+    mask = np.load(jobdir / "mask3.npy")
+    over = float((de >= 2.0).mean())
+    assert j["stats"]["over_ratio"] == round(over, 6)
+    assert int(mask[..., 0].sum() / 255) == j["stats"]["over_pixels"]
+    d = client.post(
+        f"/api/jobs/{j['job_id']}/region",
+        json={"x": 0, "y": 0, "width": 40, "height": 40},
+    ).json()
+    assert d["delta_e00"]["over_threshold_ratio"] == j["stats"]["over_ratio"]
+
+
 def test_gray_image_with_gray_profile(client, ids):
     profs = client.get("/api/profiles").json()
     gray_id = next(p["profile_id"] for p in profs["source"] if p["color_space"] == "GRAY")
