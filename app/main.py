@@ -130,24 +130,26 @@ async def create_job(
         max_dimension=MAX_DIMENSION,
     )
     try:
-        result = pl.run_pipeline(inputs, state.pm, state.lab_profile, state.srgb_profile)
+        result = pl.run_pipeline(inputs, state.pm)
     except (pl.PipelineError, ProfileError) as exc:
         raise HTTPException(422, str(exc))
 
     job_id = pl.compute_job_id(result)
     base = job_dir(job_id)
 
-    # Persist pixel arrays for region inspection (memmap friendly).
-    np.save(base / "lab_src.npy", result.lab_src.astype(np.float32))
-    np.save(base / "lab_press.npy", result.lab_press.astype(np.float32))
+    # Persist pixel arrays for region inspection at full double precision so
+    # inspection and report statistics come from exactly the same Lab/ΔE
+    # values that decided mask membership.
+    np.save(base / "lab_src.npy", result.lab_src.astype(np.float64))
+    np.save(base / "lab_press.npy", result.lab_press.astype(np.float64))
     np.save(base / "cmyk.npy", result.cmyk.astype(np.uint8))
-    np.save(base / "de.npy", result.de.astype(np.float32))
+    np.save(base / "de.npy", result.de.astype(np.float64))
     np.save(base / "heatmap.npy", result.heatmap.astype(np.uint8))
     np.save(base / "mask3.npy", result.mask.astype(np.uint8))
     (base / "original.bin").write_bytes(data)
 
     display_icc_bytes = state.pm.load_bytes(display_profile)
-    pngs = pl.export_pngs(result, state.srgb_profile, display_icc_bytes)
+    pngs = pl.export_pngs(result, state.srgb_bytes, display_icc_bytes)
     for name, blob in pngs.items():
         (base / name).write_bytes(blob)
 

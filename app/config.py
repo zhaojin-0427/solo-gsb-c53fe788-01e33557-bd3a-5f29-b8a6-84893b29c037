@@ -24,9 +24,7 @@ MAX_UPLOAD_MB = int(os.environ.get("SPD_MAX_UPLOAD_MB", "50"))
 @dataclass
 class AppState:
     pm: ProfileManager
-    lab_profile: ImageCms.ImageCmsProfile
     srgb_profile: ImageCms.ImageCmsProfile
-    lab_bytes: bytes
     srgb_bytes: bytes
 
 
@@ -38,15 +36,11 @@ def init_state() -> AppState:
     if _state is None:
         JOB_DIR.mkdir(parents=True, exist_ok=True)
         pm = ProfileManager(PROFILE_DIR)
-        lab_bytes = lcms_native.build_lab_profile_bytes()
         srgb_bytes = lcms_native.build_srgb_profile_bytes()
-        lab_profile = ImageCms.ImageCmsProfile(io.BytesIO(lab_bytes))
         srgb_profile = ImageCms.ImageCmsProfile(io.BytesIO(srgb_bytes))
         _state = AppState(
             pm=pm,
-            lab_profile=lab_profile,
             srgb_profile=srgb_profile,
-            lab_bytes=lab_bytes,
             srgb_bytes=srgb_bytes,
         )
     return _state

@@ -342,3 +342,113 @@ def test_demo_cmyk_profile_is_valid():
     header = lcms_native.read_header(data)
     assert header["color_space"] == "CMYK"
     assert header["pcs"] == "Lab"
+
+
+# ---------------------------------------------------------------------------
+# High-precision Lab PCS (TYPE_Lab_DBL) and critical-threshold mask stability
+# ---------------------------------------------------------------------------
+
+def _srgb_gray_lab_reference(v: int):
+    """Independent CIELAB D50 reference for an sRGB neutral (r=g=b=v)."""
+    c = v / 255.0
+    lin = c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    xyz = lin * lcms_native._SRGB_TO_XYZ_D50.sum(axis=1)
+    Xn, Yn, Zn = lcms_native._D50
+    s = xyz / np.array([Xn, Yn, Zn])
+    f = np.cbrt(s)
+    return np.array([116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])])
+
+
+def test_pixels_to_lab_is_double_precision():
+    """TYPE_Lab_DBL output must track the reference Lab far below 8-bit PCS steps.
+
+    ICC v2 8-bit PCS quantizes L* in 100/255 ≈ 0.39 steps and a*/b* in integer
+    steps; a double result must agree with an independent computation to ~0.05.
+    """
+    srgb = lcms_native.build_srgb_profile_bytes()
+    for v in (37, 128, 201):
+        lab = lcms_native.pixels_to_lab(
+            np.array([[v, v, v]], np.uint8), "RGB", srgb, "relative_colorimetric"
+        )[0]
+        ref = _srgb_gray_lab_reference(v)
+        assert np.abs(lab - ref).max() < 0.05, (v, lab, ref)
+    # White must come out exactly at L*=100 and neutral.
+    white = lcms_native.pixels_to_lab(
+        np.array([[255, 255, 255]], np.uint8), "RGB", srgb, "relative_colorimetric"
+    )[0]
+    assert abs(white[0] - 100.0) < 1e-9
+    assert abs(white[1]) < 1e-3 and abs(white[2]) < 1e-3
+
+
+def _quantize_v2_lab(lab: np.ndarray) -> np.ndarray:
+    """Round-trip Lab through the old ICC v2 8-bit PCS byte encoding."""
+    Lb = np.rint(lab[..., 0] * 255.0 / 100.0).clip(0, 255)
+    ab = np.rint(lab[..., 1:3]).clip(-128, 127)
+    enc = np.where(ab <= 0, ab + 256, ab)
+    return colorscience.decode_lab(
+        np.concatenate([Lb[..., None], enc], axis=-1).astype(np.uint8)
+    )
+
+
+def test_critical_threshold_mask_avoids_pcs_quantization(client, ids):
+    """Heatmap/mask/stats must use unquantized Lab; 8-bit PCS would flip pixels."""
+    from app import main
+
+    j = run(client, ids, sample_img()).json()
+    base = main.JOB_DIR / j["job_id"]
+    lab_src = np.load(base / "lab_src.npy")
+    lab_press = np.load(base / "lab_press.npy")
+    de = np.load(base / "de.npy")
+
+    # Persisted Lab/ΔE keep double precision (no float32 storage round-trip).
+    assert lab_src.dtype == np.float64 and de.dtype == np.float64
+
+    # Stored ΔE is exactly what the stored Lab yields: one source of truth for
+    # mask, statistics, region inspection and the report.
+    de_recomputed = colorscience.ciede2000(lab_src, lab_press)
+    assert np.array_equal(de, de_recomputed)
+    assert int((de >= j["stats"]["threshold"]).sum()) == j["stats"]["over_pixels"]
+
+    # The old Pillow 8-bit LAB route demonstrably moved ΔE and would have
+    # reclassified borderline pixels when the threshold sits near their true
+    # ΔE value.
+    de_v2 = colorscience.ciede2000(_quantize_v2_lab(lab_src),
+                                   _quantize_v2_lab(lab_press))
+    assert np.abs(de - de_v2).max() > 0.5
+    # Number of pixels the quantized route pushed below their true ΔE value:
+    # for each one, threshold == true ΔE would flip the mask verdict.
+    assert int((de_v2 < de).sum()) > 0
+
+
+def test_region_lab_matches_high_precision_arrays(client, ids):
+    """Region inspection Lab/ΔE come from the same persisted double arrays."""
+    from app import main
+
+    j = run(client, ids, sample_img()).json()
+    base = main.JOB_DIR / j["job_id"]
+    lab_src = np.load(base / "lab_src.npy")
+    de = np.load(base / "de.npy")
+    d = client.post(
+        f"/api/jobs/{j['job_id']}/region",
+        json={"x": 0, "y": 0, "width": 48, "height": 48},
+    ).json()
+    assert d["lab_source"]["mean"] == [round(float(v), 3)
+                                      for v in lab_src.reshape(-1, 3).mean(axis=0)]
+    assert d["delta_e00"]["mean"] == round(float(de.mean()), 4)
+    # Neutral column corner pixel (gray 0 ramp start is black -> neutral).
+    corner = client.post(
+        f"/api/jobs/{j['job_id']}/region",
+        json={"x": 0, "y": 0, "width": 1, "height": 1},
+    ).json()
+    assert abs(corner["lab_source"]["mean"][1]) < 0.05
+    assert abs(corner["lab_source"]["mean"][2]) < 0.05
+
+
+def test_soft_proof_still_tagged_with_display_profile(client, ids):
+    """The proof intent/display ICC behavior is unchanged by the Lab fix."""
+    j = run(client, ids, sample_img(), proof_intent="absolute_colorimetric").json()
+    state = client.app.state.state
+    display_bytes = state.pm.load_bytes(ids["display"])
+    resp = client.get(f"/api/jobs/{j['job_id']}/images/softproof.png")
+    im = Image.open(io.BytesIO(resp.content))
+    assert im.info["icc_profile"] == display_bytes

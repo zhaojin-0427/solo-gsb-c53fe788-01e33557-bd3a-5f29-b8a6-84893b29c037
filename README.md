@@ -1,8 +1,8 @@
 # 印前色彩软打样台（Prepress Color Soft-Proofing Station）
 
-本地运行的 Web 应用：上传 **RGB / CMYK 的 TIFF、PNG 或 JPEG** 图像，选择**源 ICC 配置、印刷 ICC 配置、显示 ICC 配置**与渲染意图，由后端通过 **LittleCMS（Pillow ImageCms）** 完成全链路色彩转换，并在浏览器中进行显示器软打样、像素级 **CIEDE2000 色差**分析与区域取色。
+本地运行的 Web 应用：上传 **RGB / CMYK 的 TIFF、PNG 或 JPEG** 图像，选择**源 ICC 配置、印刷 ICC 配置、显示 ICC 配置**与渲染意图，由后端通过 **LittleCMS 2（直接 ctypes 调用 + Pillow ImageCms）** 完成全链路色彩转换，并在浏览器中进行显示器软打样、像素级 **CIEDE2000 色差**分析与区域取色。源色与印后色以 LittleCMS 原生 `TYPE_Lab_DBL`（C double）高精度 Lab 取得，不再经过 Pillow 8 位 `LAB` 模式的额外量化。
 
-- 后端：Python 3.12 · FastAPI · SQLite · Pillow ImageCms（LittleCMS 2）· NumPy
+- 后端：Python 3.12 · FastAPI · SQLite · liblcms2 直接 ctypes（高精度 Lab）+ Pillow（图像 I/O/ImageCms）· NumPy
 - 前端：原生 HTML / CSS / JavaScript（无框架、无构建步骤）
 - 部署：Docker Compose 一键启动
 
@@ -46,17 +46,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 对每一张上传图像，后端依次执行（全部由 LittleCMS 完成转换，**绝不使用浏览器默认色彩解释**）：
 
 1. **源图显示预览**：源像素 `源配置 → 显示配置`；
-2. **沿 源 → 印刷 → Lab 回算色值**：
+2. **沿 源 → 印刷 → Lab 回算色值**（Lab 均为 LittleCMS 原生 **TYPE_Lab_DBL 双精度**结果，不经过 8 位 PCS 量化）：
    - 源像素 `源配置 → 印刷配置` 得到设备 **CMYK** 值；
-   - CMYK `印刷配置 → Lab PCS` 得到印刷后 Lab；
-   - 同时源像素 `源配置 → Lab PCS` 得到原始 Lab；
-3. **软打样图**：印刷后 Lab `→ 显示配置`（可选择显示渲染意图）；
-4. 对 `Lab_源` 与 `Lab_印刷后` 逐像素计算 **CIEDE2000（ΔE00）**；
+   - CMYK `印刷配置 → Lab PCS（double）` 得到印刷后 Lab；
+   - 同时源像素 `源配置 → Lab PCS（double）` 得到原始 Lab；
+3. **软打样图**：印刷后高精度 Lab `→ 显示配置`（可选择显示渲染意图，仍按所选显示 ICC 呈现）；
+4. 对 `Lab_源` 与 `Lab_印刷后`（同一份双精度 Lab 结果）逐像素计算 **CIEDE2000（ΔE00）**；
 5. 生成：
    - **ΔE 热图**（黑→蓝→青→绿→黄→红伪彩色）；
    - **热图叠加图**（半透明叠加在软打样上）；
    - **超阈值二值遮罩**（ΔE00 ≥ 阈值的像素为白色）；
    - 均值 / P95 / 最大 ΔE00 与**超阈值面积比例**统计。
+
+**热图、遮罩、统计、框选区域的 Lab/色差值与导出报告全部取自同一份双精度 Lab/ΔE 结果**——阈值设在像素实际 ΔE00 附近时，不会因为源色/印后色被先写成 Pillow 8 位 LAB 再解码而错误翻转临界像素的遮罩归属或超阈面积比例。
 
 输出给浏览器的 PNG 均嵌入 ICC 配置，浏览器不会按未标记数据自行解释：**源图显示预览与软打样嵌入所选择的显示配置**（像素本身位于该显示空间）；**ΔE 热图、遮罩与叠加图是无物理色度含义的合成可视化，嵌入 sRGB** 以保证颜色稳定呈现。
 
@@ -162,7 +164,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 实现说明
 
 - **色差公式**：`app/colorscience.py` 中为矢量化 CIEDE2000，已对照 Sharma 等 (2005) 标准测试数据验证（最大偏差 < 1e-3）。
-- **Lab 编码**：流水线使用 ICC **v2 8 位 Lab** 编码（`L = byte·100/255`；a/b：字节 0–127 表示 +0–+127，128–255 表示 −128–−1），像素级量化误差约 ±1 ΔE00，报告中对此有明确说明。
+- **Lab 精度**：源色与印后色由 `app/lcms_native.py` 直接 ctypes 调用 `liblcms2`，以 `cmsCreateTransform` + `TYPE_Lab_DBL`（native C double，D50 CIELAB）取回；ΔE00、热图、遮罩、统计、框选区域与 `report.json` 共用这同一份未量化结果，落盘的 Lab/ΔE 数组也以 float64 保存。仅保留 ICC v2 8 位 Lab 编解码函数用于与历史路径对比的测试。
 - **合成 CMYK 配置**：`app/lcms_native.py` 通过 ctypes 调用系统 `liblcms2` 的 `cmsCreateProfilePlaceholder` / CLUT16 pipeline API 生成 17³/17⁴ 网格的合法 ICC v2.4 CMYK 配置，保证开箱演示可用。
 - **环境变量**：
   - `SPD_DATA_DIR`（默认 `./data`）：数据根目录；
@@ -176,11 +178,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ├── app/
 │   ├── main.py          # FastAPI 路由
 │   ├── pipeline.py      # 色彩流水线、导出
-│   ├── colorscience.py  # Lab 解码、CIEDE2000、热图
+│   ├── colorscience.py  # CIEDE2000、热图（高精度 Lab 由 lcms_native 取得）
 │   ├── profiles.py      # ICC 配置管理与严格校验
 │   ├── regions.py       # 框选区域统计
 │   ├── database.py      # SQLite
-│   ├── lcms_native.py   # liblcms2 ctypes 绑定与内置配置生成
+│   ├── lcms_native.py   # liblcms2 ctypes 绑定（TYPE_Lab_DBL 高精度转换）、内置配置生成
 │   ├── config.py
 │   └── static/          # 前端
 ├── tests/               # pytest 端到端测试

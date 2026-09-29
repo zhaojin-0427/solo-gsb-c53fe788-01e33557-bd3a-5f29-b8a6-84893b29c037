@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-from PIL import Image
 
 # ---------------------------------------------------------------------------
 # LittleCMS 原始 LAB 模式字节解码 (ICC v2 8-bit encoding)
@@ -10,6 +9,10 @@ from PIL import Image
 # 注意：这里读取的是 ImageCms.applyTransform 直接返回的图像字节（lcms 原生
 # V2 编码），不要用 PIL 的 Image.new("LAB", ...) 手工构造——PIL 会按它自己
 # 的极性约定重新解释字节。
+#
+# 重要：流水线的 ΔE00 不再经过这层 8 位 PCS 编码。源色与印后色由
+# ``lcms_native.pixels_to_lab`` 以 TYPE_Lab_DBL（C double）直接取得，仅在
+# 需要与历史 8 位路径对比/测试时才使用下面的编解码函数。
 #
 # L 通道: 0..255  -> 0..100
 # a,b 通道: 字节 0..127 表示 +0..+127，128..255 表示 -128..-1
@@ -135,7 +138,3 @@ def overlay_heatmap(base_rgb: np.ndarray, heat_rgb: np.ndarray, alpha: float = 0
 def threshold_mask(de: np.ndarray, threshold: float) -> np.ndarray:
     """Binary HxW mask: white (255) where ΔE >= threshold, else black."""
     return (de >= threshold).astype(np.uint8) * 255
-
-
-def lab_image_to_array(img: Image.Image) -> np.ndarray:
-    return decode_lab(np.asarray(img))

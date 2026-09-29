@@ -9,10 +9,15 @@ liblcms2 directly for a few things Pillow cannot do:
   demonstrate the full source -> press -> display chain without requiring
   the user to ship a press profile;
 * read ICC header fields (device class / color space / PCS) for strict
-  validation.
+  validation;
+* run pixel transforms with full control over PCS precision: the color
+  pipeline asks for LittleCMS native ``TYPE_Lab_DBL`` output so source and
+  post-press Lab values feed CIEDE2000 directly as C doubles, without the
+  extra ICC v2 8-bit PCS quantization that Pillow's ``"LAB"`` mode implies.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import struct
@@ -23,6 +28,40 @@ import numpy as np
 # ICC 4-byte signatures (big-endian uint32 on the wire/API).
 def sig(value: bytes) -> int:
     return struct.unpack(">I", value)[0]
+
+
+# ---------------------------------------------------------------------------
+# LittleCMS pixel-type constants (lcms2.h: COLORSPACE_SH/CHANNELS_SH/BYTES_SH/
+# FLOAT_SH) and render intents. We construct transform input/output formats
+# ourselves instead of relying on Pillow's fixed 8-bit modes, so the Lab PCS
+# can be retrieved as native C doubles (TYPE_Lab_DBL, L* in 0..100, a*/b*
+# signed).
+# ---------------------------------------------------------------------------
+_PT_GRAY = 3
+_PT_RGB = 4
+_PT_CMYK = 6
+_PT_LAB = 10
+_TYPE_GRAY_8 = (_PT_GRAY << 16) | (1 << 3) | 1
+_TYPE_RGB_8 = (_PT_RGB << 16) | (3 << 3) | 1
+_TYPE_CMYK_8 = (_PT_CMYK << 16) | (4 << 3) | 1
+_TYPE_LAB_DBL = (1 << 22) | (_PT_LAB << 16) | (3 << 3) | 0
+
+INTENT_PERCEPTUAL = 0
+INTENT_RELATIVE_COLORIMETRIC = 1
+INTENT_SATURATION = 2
+INTENT_ABSOLUTE_COLORIMETRIC = 3
+INTENTS = {
+    "perceptual": INTENT_PERCEPTUAL,
+    "relative_colorimetric": INTENT_RELATIVE_COLORIMETRIC,
+    "saturation": INTENT_SATURATION,
+    "absolute_colorimetric": INTENT_ABSOLUTE_COLORIMETRIC,
+}
+
+_UINT8_INPUT_TYPES = {
+    "RGB": _TYPE_RGB_8,
+    "CMYK": _TYPE_CMYK_8,
+    "GRAY": _TYPE_GRAY_8,
+}
 
 
 class _CIEXYZ(ctypes.Structure):
@@ -123,6 +162,23 @@ def lcms() -> ctypes.CDLL:
     L.cmsD50_XYZ.restype = ctypes.POINTER(_CIEXYZ)
     L.cmsD50_XYZ.argtypes = []
 
+    # Direct transform API for high-precision (TYPE_Lab_DBL) PCS access.
+    L.cmsCreateTransform.restype = ctypes.c_void_p
+    L.cmsCreateTransform.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    L.cmsDeleteTransform.restype = None
+    L.cmsDeleteTransform.argtypes = [ctypes.c_void_p]
+    L.cmsDoTransform.restype = None
+    L.cmsDoTransform.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+
     return L
 
 
@@ -174,6 +230,145 @@ def read_header(data: bytes) -> dict[str, str | int]:
         "color_space": data[16:20].decode("ascii").strip(),
         "pcs": data[20:24].decode("ascii").strip(),
     }
+
+
+# ---------------------------------------------------------------------------
+# High-precision pixel transforms (Lab PCS as C doubles)
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _open_profiles(*profile_blobs: bytes):
+    """Open each ICC blob in memory and close it on exit (buffer kept alive)."""
+    L = lcms()
+    handles = []
+    keepalive = []
+    try:
+        for index, blob in enumerate(profile_blobs):
+            buf = ctypes.create_string_buffer(blob, len(blob) + 1)
+            keepalive.append(buf)
+            h = L.cmsOpenProfileFromMem(buf, ctypes.c_uint32(len(blob)))
+            if not h:
+                raise RuntimeError(f"lcms 无法打开第 {index + 1} 个 ICC 配置")
+            handles.append(h)
+        yield handles
+    finally:
+        for h in handles:
+            L.cmsCloseProfile(h)
+
+
+def _pixel_type(color_space: str) -> int:
+    try:
+        return _UINT8_INPUT_TYPES[color_space]
+    except KeyError:
+        raise RuntimeError(f"不支持的像素色彩空间: {color_space}") from None
+
+
+def _transform_pixels(
+    src_pixels: np.ndarray,
+    src_cs: str,
+    src_profile: bytes,
+    dst_profile: bytes,
+    dst_type: int,
+    intent: str,
+) -> np.ndarray:
+    """Run an lcms transform over a flat (N, C_in) uint8 array.
+
+    Returns a flat (N, C_out) array: uint8 for 8-bit destination types,
+    float64 for TYPE_Lab_DBL. The caller keeps control of PCS precision;
+    nothing passes through Pillow's fixed 8-bit LAB mode.
+    """
+    if intent not in INTENTS:
+        raise RuntimeError(f"未知渲染意图: {intent}")
+    pixels = np.ascontiguousarray(src_pixels, dtype=np.uint8).reshape(-1)
+    n_pixels = pixels.size // _channel_count(src_cs)
+    L = lcms()
+    with _open_profiles(src_profile, dst_profile) as (h_src, h_dst):
+        xform = L.cmsCreateTransform(
+            h_src, _pixel_type(src_cs),
+            h_dst, ctypes.c_uint32(dst_type),
+            ctypes.c_uint32(INTENTS[intent]), ctypes.c_uint32(0),
+        )
+        if not xform:
+            raise RuntimeError("lcms 无法建立色彩转换")
+        try:
+            channels_out = _type_channels(dst_type)
+            if dst_type == _TYPE_LAB_DBL:
+                out = np.zeros(n_pixels * channels_out, dtype=np.float64)
+            else:
+                out = np.zeros(n_pixels * channels_out, dtype=np.uint8)
+            in_ptr = pixels.ctypes.data_as(ctypes.c_void_p)
+            out_ptr = out.ctypes.data_as(ctypes.c_void_p)
+            L.cmsDoTransform(xform, in_ptr, out_ptr, ctypes.c_uint32(n_pixels))
+            return out.reshape(n_pixels, channels_out)
+        finally:
+            L.cmsDeleteTransform(xform)
+
+
+def _channel_count(color_space: str) -> int:
+    return {"GRAY": 1, "RGB": 3, "CMYK": 4}[color_space]
+
+
+def _type_channels(pixel_type: int) -> int:
+    # CHANNELS_SH occupies bits 3..10 of the type signature.
+    return (int(pixel_type) >> 3) & 0x7F
+
+
+def pixels_to_lab(pixels: np.ndarray, src_cs: str, src_profile: bytes,
+                  intent: str) -> np.ndarray:
+    """Device pixels (flat N x C uint8) -> N x 3 float64 CIELAB (D50)."""
+    return _transform_pixels(
+        pixels, src_cs, src_profile, _lab_profile_bytes(),
+        _TYPE_LAB_DBL, intent,
+    )
+
+
+def pixels_to_rgb(pixels: np.ndarray, src_cs: str, src_profile: bytes,
+                  display_profile: bytes, intent: str) -> np.ndarray:
+    """Device pixels -> N x 3 uint8 RGB under `display_profile`."""
+    return _transform_pixels(
+        pixels, src_cs, src_profile, display_profile, _TYPE_RGB_8, intent,
+    )
+
+
+def pixels_to_press_cmyk(pixels: np.ndarray, src_cs: str, src_profile: bytes,
+                         press_profile: bytes, intent: str) -> np.ndarray:
+    """Device pixels -> N x 4 uint8 press CMYK (0 = no ink, 255 = full)."""
+    return _transform_pixels(
+        pixels, src_cs, src_profile, press_profile, _TYPE_CMYK_8, intent,
+    )
+
+
+def lab_to_pixels(lab: np.ndarray, dst_profile: bytes, dst_cs: str,
+                  intent: str) -> np.ndarray:
+    """N x 3 float64 CIELAB -> N x C uint8 device pixels in `dst_profile`."""
+    lab_flat = np.ascontiguousarray(lab, dtype=np.float64).reshape(-1)
+    n_pixels = lab_flat.size // 3
+    L = lcms()
+    with _open_profiles(_lab_profile_bytes(), dst_profile) as (h_lab, h_dst):
+        xform = L.cmsCreateTransform(
+            h_lab, ctypes.c_uint32(_TYPE_LAB_DBL),
+            h_dst, ctypes.c_uint32(_pixel_type(dst_cs)),
+            ctypes.c_uint32(INTENTS[intent]), ctypes.c_uint32(0),
+        )
+        if not xform:
+            raise RuntimeError("lcms 无法建立 Lab 色彩转换")
+        try:
+            channels_out = _channel_count(dst_cs)
+            out = np.zeros(n_pixels * channels_out, dtype=np.uint8)
+            L.cmsDoTransform(
+                xform,
+                lab_flat.ctypes.data_as(ctypes.c_void_p),
+                out.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_uint32(n_pixels),
+            )
+            return out.reshape(n_pixels, channels_out)
+        finally:
+            L.cmsDeleteTransform(xform)
+
+
+@lru_cache(maxsize=1)
+def _lab_profile_bytes() -> bytes:
+    return build_lab_profile_bytes()
 
 
 # ---------------------------------------------------------------------------
